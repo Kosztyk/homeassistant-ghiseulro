@@ -15,7 +15,10 @@ LABEL org.opencontainers.image.title="ghiseul-browser" \
       org.opencontainers.image.vendor="emanuelbesliu"
 
 # Install Chromium and dependencies (using default Debian repos)
+# tini is used as PID 1 so that Chrome's orphaned child processes are reaped
+# instead of accumulating as zombies (which eventually exhausts fork()).
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    tini \
     chromium \
     chromium-sandbox \
     xvfb \
@@ -53,4 +56,6 @@ ENV LOG_LEVEL=INFO
 
 EXPOSE 8192
 
+# tini reaps zombie Chrome subprocesses (-g forwards signals to the process group)
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["python", "server.py"]

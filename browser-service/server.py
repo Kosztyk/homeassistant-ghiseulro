@@ -128,6 +128,12 @@ async def get_browser() -> nd.Browser:
                     logger.warning("Browser has no tabs, recreating...")
             except Exception as e:
                 logger.warning("Browser health check failed: %s, recreating...", e)
+            # Stop the dead/stale instance so its Chrome subprocesses are torn
+            # down (and reaped by tini) instead of leaking as zombies.
+            try:
+                browser.stop()
+            except Exception:
+                pass
             browser = None
 
         logger.info("Creating new browser instance...")
@@ -151,8 +157,12 @@ async def get_browser() -> nd.Browser:
         ext_dir = create_cloudflare_extension()
         options.add_extension(os.path.abspath(ext_dir))
 
-        browser = await nd.Browser.create(config=options)
-        shutil.rmtree(ext_dir, ignore_errors=True)
+        try:
+            browser = await nd.Browser.create(config=options)
+        finally:
+            # Always remove the temp extension dir, even if browser creation
+            # raised (otherwise /tmp/cf_ext_* leaks on every failed attempt).
+            shutil.rmtree(ext_dir, ignore_errors=True)
         logger.info("Browser created successfully")
         return browser
 
