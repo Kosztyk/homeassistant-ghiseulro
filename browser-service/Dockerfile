@@ -1,4 +1,4 @@
-FROM python:3.14-slim-bookworm
+FROM python:3.11-slim-bookworm
 
 # OCI image labels (build-time args populated by CI)
 ARG BUILD_DATE
@@ -40,9 +40,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
+# Pin to the proven-working runtime (matches image v0.1.9): newer nodriver
+# releases ship a source file that is invalid under Python 3.14 and some are
+# incompatible, so keep Python 3.11 and pin the dependency versions.
 RUN pip install --no-cache-dir \
-    aiohttp \
-    nodriver \
+    aiohttp==3.13.3 \
+    nodriver==0.48.1 \
     xvfbwrapper
 
 WORKDIR /app
