@@ -30,9 +30,10 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8192))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
-SERVICE_VERSION = "2.0.1-local.1"
+SERVICE_VERSION = "2.0.2-auto.1"
 USER_DATA_DIR = os.environ.get("USER_DATA_DIR", "/data/chrome")
 ENABLE_VNC = os.environ.get("ENABLE_VNC", "false").lower() == "true"
+CF_NATIVE_CLICK = os.environ.get("CF_NATIVE_CLICK", "true").lower() == "true"
 CF_SOLVE_TIMEOUT = min(180, max(10, float(os.environ.get("CF_SOLVE_TIMEOUT", "90"))))
 CF_RETRY_COOLDOWN = max(30, float(os.environ.get("CF_RETRY_COOLDOWN", "300")))
 
@@ -72,6 +73,7 @@ challenge_pending = False
 challenge_retry_at = 0.0
 xvfb_display = None
 vnc_processes = []
+verification_attempt = {"outcome": "not_started", "clicks": 0, "last_method": None}
 
 
 class CloudflareChallengeError(Exception):
@@ -229,8 +231,51 @@ def _walk_nodes(node):
         yield from _walk_nodes(child_document)
 
 
+async def click_cf_verify_native(tab: nd.Tab) -> bool:
+    """Recognize a visible checkbox and use X11 input on the same browser."""
+    if not CF_NATIVE_CLICK or not os.environ.get("DISPLAY"):
+        return False
+    try:
+        from native_verify import click_on_display, locate_on_display
+
+        state = await read_page_state(tab)
+        if (
+            not is_challenge(state)
+            or urlsplit(state.get("url", "")).hostname != "www.ghiseul.ro"
+        ):
+            return False
+        await tab.activate()
+        await asyncio.sleep(0.15)
+        match = await asyncio.to_thread(locate_on_display)
+        if not match:
+            return False
+        # The page may have finished verification while the image was analyzed.
+        state = await read_page_state(tab)
+        if (
+            not is_challenge(state)
+            or urlsplit(state.get("url", "")).hostname != "www.ghiseul.ro"
+        ):
+            return False
+        await asyncio.to_thread(click_on_display, match["x"], match["y"])
+        verification_attempt["last_method"] = "native_x11"
+        verification_attempt["native_match_score"] = match["confidence"]
+        logger.info(
+            "Unattended verification: native X11 checkbox click (match %.3f)",
+            match["confidence"],
+        )
+        return True
+    except Exception as err:
+        # Surface a missing display/dependency once instead of silently waiting.
+        if "native_error" not in verification_attempt:
+            verification_attempt["native_error"] = str(err)
+            logger.warning("Native verification unavailable: %s", err)
+        return False
+
+
 async def click_cf_verify(tab: nd.Tab) -> bool:
-    """Find actual checkbox nodes, without a text/ID gate or URL rewriting."""
+    """Try native display input, then an accessible Cloudflare frame."""
+    if await click_cf_verify_native(tab):
+        return True
     try:
         await tab.browser.update_targets()
         for target in tab.browser.targets:
@@ -251,7 +296,10 @@ async def click_cf_verify(tab: nd.Tab) -> bool:
                     and "disabled" not in attrs
                 ):
                     await nd.Element(node, target, doc).mouse_click()
-                    logger.info("Cloudflare verification checkbox clicked")
+                    verification_attempt["last_method"] = "cdp_frame"
+                    logger.info(
+                        "Unattended verification: Cloudflare frame checkbox click"
+                    )
                     return True
     except Exception as e:
         logger.debug("Cloudflare checkbox is not accessible: %s", e)
@@ -289,11 +337,12 @@ def is_blocked(state: dict) -> bool:
 
 
 async def solve_cf_challenge(tab: nd.Tab, timeout: float = CF_SOLVE_TIMEOUT):
-    """Wait within a strict deadline, then retain the page for a manual check."""
-    global challenge_pending, challenge_retry_at
+    """Attempt unattended verification within a deadline, with bounded input."""
+    global challenge_pending, challenge_retry_at, verification_attempt
     started = time.monotonic()
     next_click_at = started + 3
     state = {}
+    verification_attempt = {"outcome": "waiting", "clicks": 0, "last_method": None}
     try:
         async with asyncio.timeout(timeout):
             while True:
@@ -306,8 +355,9 @@ async def solve_cf_challenge(tab: nd.Tab, timeout: float = CF_SOLVE_TIMEOUT):
                 if is_blocked(state):
                     challenge_pending = True
                     challenge_retry_at = time.monotonic() + CF_RETRY_COOLDOWN
+                    verification_attempt["outcome"] = "blocked"
                     raise CloudflareChallengeError(
-                        "Cloudflare denied access. Open the browser console and inspect the page.",
+                        "Cloudflare denied access. See /diagnostics for the page state and Ray ID.",
                         code="cloudflare_blocked",
                         retry_after=math.ceil(CF_RETRY_COOLDOWN),
                     )
@@ -315,9 +365,14 @@ async def solve_cf_challenge(tab: nd.Tab, timeout: float = CF_SOLVE_TIMEOUT):
                     not is_challenge(state)
                     and state.get("ready") != "loading"
                     and urlsplit(state.get("url", "")).hostname == "www.ghiseul.ro"
+                    and "ghiseul.ro" in state.get("title", "").lower()
                 ):
                     challenge_pending = False
                     challenge_retry_at = 0.0
+                    verification_attempt["outcome"] = "verified"
+                    verification_attempt["elapsed_seconds"] = round(
+                        time.monotonic() - started, 1
+                    )
                     logger.info(
                         "Ghiseul.ro page ready after %.1fs", time.monotonic() - started
                     )
@@ -325,9 +380,14 @@ async def solve_cf_challenge(tab: nd.Tab, timeout: float = CF_SOLVE_TIMEOUT):
                 if is_challenge(state) and not challenge_pending:
                     challenge_pending = True
                     logger.info("Cloudflare challenge detected: %s", state.get("title"))
-                if is_challenge(state) and time.monotonic() >= next_click_at:
+                if (
+                    is_challenge(state)
+                    and time.monotonic() >= next_click_at
+                    and verification_attempt["clicks"] < 3
+                ):
                     try:
-                        await asyncio.wait_for(click_cf_verify(tab), timeout=5)
+                        if await asyncio.wait_for(click_cf_verify(tab), timeout=8):
+                            verification_attempt["clicks"] += 1
                     except TimeoutError:
                         logger.debug(
                             "Checkbox discovery timed out; still waiting for verification"
@@ -337,17 +397,19 @@ async def solve_cf_challenge(tab: nd.Tab, timeout: float = CF_SOLVE_TIMEOUT):
     except TimeoutError:
         challenge_pending = True
         challenge_retry_at = time.monotonic() + CF_RETRY_COOLDOWN
+        verification_attempt["outcome"] = "timeout"
+        verification_attempt["elapsed_seconds"] = round(time.monotonic() - started, 1)
         logger.warning("Cloudflare/page timeout: %s", json.dumps(state))
         raise CloudflareChallengeError(
-            f"Cloudflare/page verification did not finish within {timeout:g}s. "
-            "The page is kept open. Complete verification in the browser console "
-            "on port 6080, then retry. See /diagnostics for page state.",
+            f"Unattended Cloudflare verification did not finish within {timeout:g}s. "
+            f"The next request after {math.ceil(CF_RETRY_COOLDOWN)}s can retry automatically. "
+            "See /diagnostics for click attempts and page state.",
             retry_after=math.ceil(CF_RETRY_COOLDOWN),
         ) from None
 
 
 async def navigate_and_solve(url: str) -> nd.Tab:
-    """Reuse one browser tab, including a pending manual verification page."""
+    """Reuse the profile/tab and retry expired challenges after the cooldown."""
     global active_tab, challenge_pending, challenge_retry_at
     drv = await get_browser()
     if active_tab is not None and not active_tab.closed and challenge_pending:
@@ -359,11 +421,15 @@ async def navigate_and_solve(url: str) -> nd.Tab:
         elif time.monotonic() < challenge_retry_at:
             remaining = math.ceil(challenge_retry_at - time.monotonic())
             raise CloudflareChallengeError(
-                "Cloudflare verification is still pending. Complete it in the browser "
-                "console on port 6080; automatic retries are paused.",
+                f"Cloudflare verification is pending. Next unattended attempt in {remaining}s.",
                 retry_after=remaining,
             )
-        # Do not reload a challenge that a user is currently completing.
+        elif challenge_retry_at:
+            # A failed widget can expire. Refresh once per cooldown, preserving
+            # the same browser/profile, instead of clicking a stale widget forever.
+            challenge_retry_at = 0.0
+            logger.info("Retrying expired verification page after cooldown")
+            await asyncio.wait_for(active_tab.reload(), timeout=15)
     else:
         active_tab = await asyncio.wait_for(drv.get(url), timeout=30)
     await solve_cf_challenge(active_tab)
@@ -516,6 +582,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "browser_started": browser is not None,
             "verification_pending": challenge_pending,
             "console_enabled": ENABLE_VNC,
+            "native_click_enabled": CF_NATIVE_CLICK,
         }
     )
 
@@ -538,6 +605,7 @@ async def handle_diagnostics(request: web.Request) -> web.Response:
             "console_enabled": ENABLE_VNC,
             "console_running": bool(vnc_processes)
             and all(p.returncode is None for p in vnc_processes),
+            "verification_attempt": verification_attempt,
         }
     )
 
@@ -552,6 +620,20 @@ async def handle_open_browser(request: web.Request) -> web.Response:
     challenge_pending = True
     return web.json_response(
         {"status": "ok", "message": "Browser open; complete verification on port 6080"}
+    )
+
+
+async def handle_verify(request: web.Request) -> web.Response:
+    """Test unattended page verification without submitting account credentials."""
+    tab = await navigate_and_solve(f"{BASE_URL}/")
+    return web.json_response(
+        {
+            "status": "ok",
+            "verified": True,
+            "version": SERVICE_VERSION,
+            "page": await read_page_state(tab),
+            "verification_attempt": verification_attempt,
+        }
     )
 
 
@@ -1077,6 +1159,7 @@ def create_app() -> web.Application:
     app.router.add_get("/health", handle_health)
     app.router.add_get("/diagnostics", handle_diagnostics)
     app.router.add_post("/open-browser", handle_open_browser)
+    app.router.add_post("/verify", handle_verify)
     app.router.add_post("/login", handle_login)
     app.router.add_get("/check-login", handle_check_login)
     app.router.add_get("/debts", handle_debts)
