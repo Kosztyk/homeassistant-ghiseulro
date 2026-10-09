@@ -22,6 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-sandbox \
     xvfb \
+    x11vnc \
+    novnc \
+    websockify \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -56,8 +59,11 @@ ENV HEADLESS=true
 ENV HOST=0.0.0.0
 ENV PORT=8192
 ENV LOG_LEVEL=INFO
+ENV USER_DATA_DIR=/data/chrome
+ENV CF_SOLVE_TIMEOUT=90
+ENV CF_RETRY_COOLDOWN=300
 
-EXPOSE 8192
+EXPOSE 8192 6080
 
 # tini reaps zombie Chrome subprocesses (-g forwards signals to the process group)
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
